@@ -1,14 +1,24 @@
-import { Narrative } from './narrator.js';
-
-// ---------------------------------------------------------------------------
-// Output formatters
-// ---------------------------------------------------------------------------
+import { Narrative, BranchArc, PlotPoint } from './narrator.js';
 
 export type OutputFormat = 'text' | 'markdown' | 'slides';
 
-/**
- * Render a Narrative in the requested format.
- */
+function formatDate(date: Date): string {
+  return date.toISOString().split('T')[0];
+}
+
+function formatPlotPoint(p: PlotPoint): string {
+  return `  - ${p.hash.slice(0,7)} ${formatDate(p.date)} ${p.author}: ${p.message} (weight: ${p.weight.toFixed(2)})`;
+}
+
+function formatBranchArc(arc: BranchArc): string {
+  let out = `## ${arc.branchName}\n`;
+  out += `- From ${formatDate(arc.startDate)} to ${formatDate(arc.endDate)}, ${arc.commits.length} commits, ${arc.mergeCount} merges\n`;
+  for (const c of arc.commits) {
+    out += formatPlotPoint(c) + '\n';
+  }
+  return out;
+}
+
 export function renderNarrative(narrative: Narrative, format: OutputFormat): string {
   switch (format) {
     case 'text':
@@ -18,164 +28,121 @@ export function renderNarrative(narrative: Narrative, format: OutputFormat): str
     case 'slides':
       return renderSlides(narrative);
     default:
-      throw new Error(`Unknown output format: ${format}`);
+      throw new Error(`Unknown format: ${format}`);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Plain text
-// ---------------------------------------------------------------------------
-
-function renderText(n: Narrative): string {
+function renderText(narrative: Narrative): string {
   const lines: string[] = [];
-
-  lines.push(n.title);
-  lines.push('='.repeat(n.title.length));
+  lines.push(narrative.title);
+  lines.push('='.repeat(narrative.title.length));
   lines.push('');
-  lines.push(n.summary);
+  lines.push(narrative.summary);
   lines.push('');
-
-  lines.push('Protagonist Branches');
-  lines.push('--------------------');
-  for (const b of n.protagonistBranches) {
-    lines.push(`  ${b.branchName} (${b.commits.length} commits, merged ${b.mergeCount} times)`);
-    lines.push(`    Duration: ${b.startDate.toISOString().slice(0,10)} to ${b.endDate.toISOString().slice(0,10)}`);
-    for (const pc of b.commits.slice(0, 5)) {
-      lines.push(`    - ${pc.hash.slice(0,7)} ${pc.message}`);
-    }
-    if (b.commits.length > 5) {
-      lines.push(`    ... and ${b.commits.length - 5} more`);
-    }
-  }
+  lines.push('---');
   lines.push('');
-
-  if (n.conflictArcs.length > 0) {
-    lines.push('Conflict Arcs');
-    lines.push('-------------');
-    for (const c of n.conflictArcs) {
-      lines.push(`  Branches: ${c.branches.join(', ')}`);
-      lines.push(`  ${c.description}`);
+  for (const arc of narrative.protagonistBranches) {
+    lines.push(`Branch: ${arc.branchName}`);
+    lines.push(`Period: ${formatDate(arc.startDate)} - ${formatDate(arc.endDate)}`);
+    lines.push(`Commits: ${arc.commits.length} | Merges: ${arc.mergeCount}`);
+    for (const c of arc.commits) {
+      lines.push(formatPlotPoint(c));
     }
     lines.push('');
   }
-
-  lines.push('Statistics');
-  lines.push('----------');
-  lines.push(`  Merge storms: ${n.mergeStorms}`);
-  lines.push(`  Long-lived branches: ${n.longLivedBranches}`);
-  lines.push(`  Refactor hotspots: ${n.refactorHotspots}`);
+  if (narrative.conflictArcs.length > 0) {
+    lines.push('Conflicts:');
+    for (const ca of narrative.conflictArcs) {
+      lines.push(`  ${ca.branches.join(' vs ')}: ${ca.description}`);
+    }
+    lines.push('');
+  }
+  lines.push('--- Stats ---');
+  lines.push(`Merge storms: ${narrative.mergeStorms}`);
+  lines.push(`Long-lived branches: ${narrative.longLivedBranches}`);
+  lines.push(`Refactor hotspots: ${narrative.refactorHotspots}`);
   lines.push('');
-
-  lines.push('---');
-  lines.push('');
-  for (const p of n.paragraphs) {
+  // Paragraphs
+  for (const p of narrative.paragraphs) {
     lines.push(p);
     lines.push('');
   }
-
-  return lines.join('\
-');
+  return lines.join('\n');
 }
 
-// ---------------------------------------------------------------------------
-// Markdown
-// ---------------------------------------------------------------------------
-
-function renderMarkdown(n: Narrative): string {
+function renderMarkdown(narrative: Narrative): string {
   const lines: string[] = [];
-
-  lines.push(`# ${n.title}`);
+  lines.push(`# ${narrative.title}`);
   lines.push('');
-  lines.push(n.summary);
+  lines.push(narrative.summary);
   lines.push('');
-
-  lines.push('## Protagonist Branches');
+  lines.push('---');
   lines.push('');
-  for (const b of n.protagonistBranches) {
-    lines.push(`### ${b.branchName}`);
+  for (const arc of narrative.protagonistBranches) {
+    lines.push(formatBranchArc(arc));
     lines.push('');
-    lines.push(`- **Commits:** ${b.commits.length}`);
-    lines.push(`- **Merges:** ${b.mergeCount}`);
-    lines.push(`- **Duration:** ${b.startDate.toISOString().slice(0,10)} → ${b.endDate.toISOString().slice(0,10)}`);
+  }
+  if (narrative.conflictArcs.length > 0) {
+    lines.push('## Conflicts');
     lines.push('');
-    lines.push('| Hash | Message |');
-    lines.push('|------|---------|');
-    for (const pc of b.commits.slice(0, 10)) {
-      lines.push(`| \`${pc.hash.slice(0,7)}\` | ${pc.message.replace(/\|/g, '\\|')} |`);
-    }
-    if (b.commits.length > 10) {
-      lines.push(`| ... | *${b.commits.length - 10} more commits* |`);
+    for (const ca of narrative.conflictArcs) {
+      lines.push(`- **${ca.branches.join(' vs ')}**: ${ca.description}`);
     }
     lines.push('');
   }
-
-  if (n.conflictArcs.length > 0) {
-    lines.push('## Conflict Arcs');
-    lines.push('');
-    for (const c of n.conflictArcs) {
-      lines.push(`- **${c.branches.join(' vs ')}**: ${c.description}`);
-    }
-    lines.push('');
-  }
-
   lines.push('## Statistics');
   lines.push('');
   lines.push(`| Metric | Value |`);
   lines.push(`|--------|-------|`);
-  lines.push(`| Merge storms | ${n.mergeStorms} |`);
-  lines.push(`| Long-lived branches | ${n.longLivedBranches} |`);
-  lines.push(`| Refactor hotspots | ${n.refactorHotspots} |`);
+  lines.push(`| Merge storms | ${narrative.mergeStorms} |`);
+  lines.push(`| Long-lived branches | ${narrative.longLivedBranches} |`);
+  lines.push(`| Refactor hotspots | ${narrative.refactorHotspots} |`);
   lines.push('');
-
-  lines.push('---');
+  lines.push('## Story');
   lines.push('');
-  for (const p of n.paragraphs) {
+  for (const p of narrative.paragraphs) {
     lines.push(p);
     lines.push('');
   }
-
-  return lines.join('\
-');
+  return lines.join('\n');
 }
 
-// ---------------------------------------------------------------------------
-// Animated terminal slides (simple ASCII frame format)
-// ---------------------------------------------------------------------------
-
-function renderSlides(n: Narrative): string {
-  // Returns a multi-line string where each slide is separated by a form feed
-  // so that a terminal or Ink renderer can display them one by one.
+function renderSlides(narrative: Narrative): string {
+  // For now, return a simple text-based slide representation
+  // Future: ink-based animated terminal slides
   const slides: string[] = [];
-
-  // Slide 1: Title
-  slides.push(`╔${'═'.repeat(58)}╗`);
-  slides.push(`║ ${n.title.padEnd(56)} ║`);
-  slides.push(`║${'═'.repeat(58)}║`);
-  slides.push(`║ ${n.summary.padEnd(56)} ║`);
-  slides.push(`╚${'═'.repeat(58)}╝`);
-
-  // Slide 2: Protagonist Branches
-  const branchLines: string[] = [];
-  branchLines.push(`╔${'═'.repeat(58)}╗`);
-  branchLines.push(`║ Protagonist Branches${' '.repeat(38)}║`);
-  branchLines.push(`║${'═'.repeat(58)}║`);
-  for (const b of n.protagonistBranches.slice(0, 6)) {
-    branchLines.push(`║ ${b.branchName.padEnd(56)} ║`);
-    branchLines.push(`║   Commits: ${String(b.commits.length).padEnd(46)} ║`);
-    branchLines.push(`║   Merges:  ${String(b.mergeCount).padEnd(46)} ║`);
+  slides.push(`=== Slide 1: ${narrative.title} ===`);
+  slides.push(narrative.summary);
+  slides.push('');
+  for (let i = 0; i < narrative.protagonistBranches.length; i++) {
+    const arc = narrative.protagonistBranches[i];
+    slides.push(`=== Slide ${i + 2}: Branch ${arc.branchName} ===`);
+    slides.push(`Period: ${formatDate(arc.startDate)} - ${formatDate(arc.endDate)}`);
+    slides.push(`Commits: ${arc.commits.length} | Merges: ${arc.mergeCount}`);
+    for (const c of arc.commits) {
+      slides.push(formatPlotPoint(c));
+    }
+    slides.push('');
   }
-  if (n.protagonistBranches.length > 6) {
-    branchLines.push(`║   ... and ${n.protagonistBranches.length - 6} more${' '.repeat(46)}║`);
+  const conflictSlideIndex = narrative.protagonistBranches.length + 2;
+  if (narrative.conflictArcs.length > 0) {
+    slides.push(`=== Slide ${conflictSlideIndex}: Conflicts ===`);
+    for (const ca of narrative.conflictArcs) {
+      slides.push(`- ${ca.branches.join(' vs ')}: ${ca.description}`);
+    }
+    slides.push('');
   }
-  branchLines.push(`╚${'═'.repeat(58)}╝`);
-  slides.push(branchLines.join('\
-'));
-
-  // Slide 3: Conflict Arcs
-  const conflictLines: string[] = [];
-  conflictLines.push(`╔${'═'.repeat(58)}╗`);
-  conflictLines.push(`║ Conflict Arcs${' '.repeat(44)}║`);
-  conflictLines.push(`║${'═'.repeat(58)}║`);
-  if (n.conflictArcs.length === 0) {
-    conflictLines.push(`║ No conflicts detected.${' '.repeat(37)}║`);
+  const statsSlideIndex = conflictSlideIndex + (narrative.conflictArcs.length > 0 ? 1 : 0);
+  slides.push(`=== Slide ${statsSlideIndex}: Statistics ===`);
+  slides.push(`Merge storms: ${narrative.mergeStorms}`);
+  slides.push(`Long-lived branches: ${narrative.longLivedBranches}`);
+  slides.push(`Refactor hotspots: ${narrative.refactorHotspots}`);
+  slides.push('');
+  const storySlideIndex = statsSlideIndex + 1;
+  for (let i = 0; i < narrative.paragraphs.length; i++) {
+    slides.push(`=== Slide ${storySlideIndex + i}: Chapter ${i + 1} ===`);
+    slides.push(narrative.paragraphs[i]);
+    slides.push('');
   }
+  return slides.join('\n');
+}
