@@ -39,176 +39,175 @@ export interface Narrative {
 }
 
 // ---------------------------------------------------------------------------
-// Narrative generation
+// Helper: detect merge storms (multiple merges in a short time window)
 // ---------------------------------------------------------------------------
 
-const IMPERATIVE_VERBS = /\b(add|fix|update|remove|refactor|implement|change|rename|move|delete|create|extract|merge|revert|bump|chore|docs|test|feat|perf|style|ci|build|revert)\b/i;
-const ISSUE_PATTERN = /[A-Z]+-\d+/;
+const MERGE_STORM_WINDOW_MS = 3600000; // 1 hour
+const MERGE_STORM_THRESHOLD = 3; // at least 3 merges in window
 
-/**
- * Compute narrative weight for a commit based on message cues.
- */
-function computeWeight(message: string): number {
-  let weight = 1;
-  if (IMPERATIVE_VERBS.test(message)) weight += 1;
-  if (ISSUE_PATTERN.test(message)) weight += 1;
-  if (message.length > 80) weight += 0.5;
-  return weight;
-}
+function detectMergeStorms(graph: CommitGraph): number {
+  const merges = graph.nodes.filter(n => n.parents.length > 1);
+  if (merges.length < MERGE_STORM_THRESHOLD) return 0;
 
-/**
- * Extract plot points from commit graph, sorted by date.
- */
-function extractPlotPoints(graph: CommitGraph): PlotPoint[] {
-  const points: PlotPoint[] = [];
-  for (const [, node] of graph.commits) {
-    points.push({
-      hash: node.hash,
-      author: node.author,
-      date: node.date,
-      message: node.message,
-      branches: node.branches,
-      weight: computeWeight(node.message),
-    });
+  // Sort by date
+  merges.sort((a, b) => a.date.getTime() - b.date.getTime());
+
+  let stormCount = 0;
+  for (let i = 0; i <= merges.length - MERGE_STORM_THRESHOLD; i++) {
+    const windowStart = merges[i].date.getTime();
+    const windowEnd = windowStart + MERGE_STORM_WINDOW_MS;
+    let count = 1;
+    for (let j = i + 1; j < merges.length; j++) {
+      if (merges[j].date.getTime() <= windowEnd) {
+        count++;
+      } else {
+        break;
+      }
+    }
+    if (count >= MERGE_STORM_THRESHOLD) {
+      stormCount++;
+    }
   }
-  points.sort((a, b) => a.date.getTime() - b.date.getTime());
-  return points;
+  return stormCount;
 }
 
-/**
- * Identify protagonist branches: those with most plot points or merges.
- */
-function identifyProtagonistBranches(points: PlotPoint[], graph: CommitGraph): BranchArc[] {
-  const branchCommits = new Map<string, PlotPoint[]>();
-  for (const point of points) {
-    for (const branch of point.branches) {
+// ---------------------------------------------------------------------------
+// Helper: detect long-lived branches (branches that live > 30 days)
+// ---------------------------------------------------------------------------
+
+const LONG_LIVED_DAYS = 30;
+
+function detectLongLivedBranches(graph: CommitGraph): number {
+  const branchCommits: Map<string, CommitNode[]> = new Map();
+  for (const node of graph.nodes) {
+    for (const branch of node.branches) {
       if (!branchCommits.has(branch)) {
         branchCommits.set(branch, []);
       }
-      branchCommits.get(branch)!.push(point);
+      branchCommits.get(branch)!.push(node);
     }
   }
 
-  const arcs: BranchArc[] = [];
-  for (const [branchName, commits] of branchCommits) {
-    if (commits.length < 2) continue; // skip trivial branches
-    const sorted = commits.sort((a, b) => a.date.getTime() - b.date.getTime());
-    const mergeCount = sorted.filter(c => c.message.toLowerCase().startsWith('merge')).length;
-    arcs.push({
-      branchName,
-      commits: sorted,
-      startDate: sorted[0].date,
-      endDate: sorted[sorted.length - 1].date,
-      mergeCount,
-    });
-  }
-
-  arcs.sort((a, b) => b.commits.length - a.commits.length);
-  return arcs.slice(0, 5); // top 5 branches
-}
-
-/**
- * Detect conflict arcs: merge commits that involve multiple branches.
- */
-function detectConflictArcs(graph: CommitGraph): ConflictArc[] {
-  const arcs: ConflictArc[] = [];
-  for (const [, node] of graph.commits) {
-    if (node.parents.length > 1) {
-      const branches = node.branches.filter(b => b !== 'HEAD' && !b.startsWith('tag: '));
-      if (branches.length >= 2) {
-        arcs.push({
-          branches,
-          mergeHashes: [node.hash],
-          description: `Merge of ${branches.slice(0, 3).join(', ')}` +
-            (branches.length > 3 ? ` and ${branches.length - 3} more` : ''),
-        });
-      }
+  let longLivedCount = 0;
+  for (const [, commits] of branchCommits) {
+    if (commits.length < 2) continue;
+    commits.sort((a, b) => a.date.getTime() - b.date.getTime());
+    const start = commits[0].date.getTime();
+    const end = commits[commits.length - 1].date.getTime();
+    const days = (end - start) / (1000 * 60 * 60 * 24);
+    if (days > LONG_LIVED_DAYS) {
+      longLivedCount++;
     }
   }
-  return arcs.slice(0, 10);
+  return longLivedCount;
 }
 
-/**
- * Count merge storms: days with >= 3 merges.
- */
-function countMergeStorms(graph: CommitGraph): number {
-  const mergeDates = new Map<string, number>();
-  for (const [, node] of graph.commits) {
-    if (node.parents.length > 1) {
-      const day = node.date.toISOString().slice(0, 10);
-      mergeDates.set(day, (mergeDates.get(day) || 0) + 1);
-    }
-  }
-  let storms = 0;
-  for (const count of mergeDates.values()) {
-    if (count >= 3) storms++;
-  }
-  return storms;
-}
+// ---------------------------------------------------------------------------
+// Helper: detect refactor hotspots (commits with refactor keywords)
+// ---------------------------------------------------------------------------
 
-/**
- * Count long-lived branches: those with span > 30 days and > 5 commits.
- */
-function countLongLivedBranches(arcs: BranchArc[]): number {
+const REFACTOR_KEYWORDS = /\b(refactor|reorganize|restructure|rewrite|cleanup|redesign|rework)\b/i;
+
+function detectRefactorHotspots(graph: CommitGraph): number {
   let count = 0;
-  for (const arc of arcs) {
-    const spanDays = (arc.endDate.getTime() - arc.startDate.getTime()) / (1000 * 60 * 60 * 24);
-    if (spanDays > 30 && arc.commits.length > 5) count++;
-  }
-  return count;
-}
-
-/**
- * Count refactor hotspots: commits with 'refactor' or 'rename' in message.
- */
-function countRefactorHotspots(graph: CommitGraph): number {
-  let count = 0;
-  for (const [, node] of graph.commits) {
-    if (/\b(refactor|rename|move|extract)\b/i.test(node.message)) {
+  for (const node of graph.nodes) {
+    if (REFACTOR_KEYWORDS.test(node.message)) {
       count++;
     }
   }
   return count;
 }
 
-/**
- * Generate a multi-paragraph narrative from the commit graph.
- */
-export function generateNarrative(graph: CommitGraph): Narrative {
-  const points = extractPlotPoints(graph);
-  const protagonistBranches = identifyProtagonistBranches(points, graph);
-  const conflictArcs = detectConflictArcs(graph);
-  const mergeStorms = countMergeStorms(graph);
-  const longLivedBranches = countLongLivedBranches(protagonistBranches);
-  const refactorHotspots = countRefactorHotspots(graph);
+// ---------------------------------------------------------------------------
+// Helper: extract protagonist branches (branches with most commits)
+// ---------------------------------------------------------------------------
 
-  const totalCommits = graph.commits.size;
-  const topBranch = protagonistBranches[0];
+function extractProtagonistBranches(graph: CommitGraph, topN: number = 3): BranchArc[] {
+  const branchCommits: Map<string, CommitNode[]> = new Map();
+  for (const node of graph.nodes) {
+    for (const branch of node.branches) {
+      if (!branchCommits.has(branch)) {
+        branchCommits.set(branch, []);
+      }
+      branchCommits.get(branch)!.push(node);
+    }
+  }
+
+  const sortedBranches = Array.from(branchCommits.entries())
+    .map(([name, commits]) => ({
+      branchName: name,
+      commits,
+      startDate: commits.reduce((min, c) => c.date < min ? c.date : min, commits[0].date),
+      endDate: commits.reduce((max, c) => c.date > max ? c.date : max, commits[0].date),
+      mergeCount: commits.filter(c => c.parents.length > 1).length,
+    }))
+    .sort((a, b) => b.commits.length - a.commits.length)
+    .slice(0, topN);
+
+  return sortedBranches.map(b => ({
+    branchName: b.branchName,
+    commits: b.commits.map(c => ({
+      hash: c.hash,
+      author: c.author,
+      date: c.date,
+      message: c.message,
+      branches: c.branches,
+      weight: c.weight,
+    })),
+    startDate: b.startDate,
+    endDate: b.endDate,
+    mergeCount: b.mergeCount,
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// Helper: detect conflict arcs (branches that merged with many parents)
+// ---------------------------------------------------------------------------
+
+function extractConflictArcs(graph: CommitGraph): ConflictArc[] {
+  const arcs: ConflictArc[] = [];
+  const merges = graph.nodes.filter(n => n.parents.length > 1);
+  for (const merge of merges) {
+    arcs.push({
+      branches: merge.branches,
+      mergeHashes: [merge.hash],
+      description: `Merge on ${merge.branches.join(', ')} involving ${merge.parents.length} parents`,
+    });
+  }
+  return arcs;
+}
+
+// ---------------------------------------------------------------------------
+// Main narrative builder
+// ---------------------------------------------------------------------------
+
+export function buildNarrative(graph: CommitGraph): Narrative {
+  const protagonistBranches = extractProtagonistBranches(graph);
+  const conflictArcs = extractConflictArcs(graph);
+  const mergeStorms = detectMergeStorms(graph);
+  const longLivedBranches = detectLongLivedBranches(graph);
+  const refactorHotspots = detectRefactorHotspots(graph);
+
+  const totalCommits = graph.nodes.length;
+  const totalAuthors = new Set(graph.nodes.map(n => n.author)).size;
+  const totalMerges = graph.nodes.filter(n => n.parents.length > 1).length;
 
   const paragraphs: string[] = [];
 
-  // Paragraph 1: Overview
+  // Opening paragraph
   paragraphs.push(
-    `This repository's story spans ${totalCommits} commits across ${graph.rootHashes.length} root histories.` +
-    (topBranch
-      ? ` The most active branch was "${topBranch.branchName}" with ${topBranch.commits.length} contributions.`
-      : '')
+    `This repository tells the story of ${totalCommits} commits by ${totalAuthors} contributors across ${graph.nodes.reduce((acc, n) => acc + n.branches.length, 0)} branch references.`
   );
 
-  // Paragraph 2: Protagonist branches
+  // Protagonist branches
   if (protagonistBranches.length > 0) {
     const branchList = protagonistBranches
-      .slice(0, 3)
-      .map(b => `${b.branchName} (${b.commits.length} commits)`)
+      .map(b => `${b.branchName} (${b.commits.length} commits, ${b.mergeCount} merges)`)
       .join(', ');
-    paragraphs.push(`Key branches driving development: ${branchList}.`);
+    paragraphs.push(`The main protagonists are the branches: ${branchList}.`);
   }
 
-  // Paragraph 3: Conflict arcs
-  if (conflictArcs.length > 0) {
-    const conflictDesc = conflictArcs
-      .slice(0, 3)
-      .map(c => c.description)
-      .join('; ');
-    paragraphs.push(`Notable merge conflicts arose: ${conflictDesc}.`);
-  }
+  // Merge storms
+  if (mergeStorms > 0) {
+    paragraphs.push(
+      `The repository experienced ${mergeStorms} merge storm${mergeStorms > 1 ? 's' : ''}
