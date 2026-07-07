@@ -1,197 +1,209 @@
+import { CommitGraph, CommitNode } from './parser.js';
 import { Narrative, PlotPoint, BranchArc, ConflictArc } from './narrator.js';
 
 export type OutputFormat = 'text' | 'markdown' | 'slides';
 
-function formatDate(date: Date): string {
-  return date.toISOString().slice(0, 10);
+// ---------------------------------------------------------------------------
+// Terminal control constants for animated slides
+// ---------------------------------------------------------------------------
+
+const ESC = '\x1b';
+const CSI = ESC + '[';
+
+function cursorHide(): string {
+  return CSI + '?25l';
 }
 
-function formatDateShort(date: Date): string {
-  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+function cursorShow(): string {
+  return CSI + '?25h';
 }
 
-function formatPlotPoint(p: PlotPoint): string {
-  return `  - ${p.hash.slice(0, 7)} | ${p.author} | ${formatDate(p.date)} | ${p.message}`;
+function cursorUp(n: number): string {
+  return CSI + n + 'A';
 }
 
-function formatBranchArc(arc: BranchArc): string {
-  const lines: string[] = [
-    `Branch: ${arc.branchName}`,
-    `  Classification: ${arc.classification}`,
-    `  Lifespan: ${arc.lifespanDays} day(s)`,
-    `  Merges: ${arc.mergeCount}`,
-    `  Period: ${formatDate(arc.startDate)} → ${formatDate(arc.endDate)}`,
-    `  Commits (${arc.commits.length}):`,
-  ];
-  for (const c of arc.commits) {
-    lines.push(formatPlotPoint(c));
-  }
-  return lines.join('\
-');
+function clearLine(): string {
+  return CSI + '2K';
 }
 
-function formatConflictArc(arc: ConflictArc): string {
-  return `Conflict: ${arc.description}\
-  Branches: ${arc.branches.join(', ')}\
-  Merge hashes: ${arc.mergeHashes.map(h => h.slice(0, 7)).join(', ')}`;
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function formatText(narrative: Narrative): string {
+// ---------------------------------------------------------------------------
+// Text rendering
+// ---------------------------------------------------------------------------
+
+function renderText(narrative: Narrative): string {
   const lines: string[] = [];
-  lines.push(`# ${narrative.title}`);
+
+  lines.push(narrative.title);
+  lines.push('='.repeat(narrative.title.length));
   lines.push('');
   lines.push(narrative.summary);
   lines.push('');
-  lines.push(`Merge storms: ${narrative.mergeStorms}`);
-  lines.push(`Long-lived branches: ${narrative.longLivedBranches}`);
-  lines.push(`Refactor hotspots: ${narrative.refactorHotspots}`);
-  lines.push('');
-  lines.push('## Protagonist Branches');
-  for (const arc of narrative.protagonistBranches) {
-    lines.push(formatBranchArc(arc));
-    lines.push('');
-  }
-  lines.push('## Conflict Arcs');
-  if (narrative.conflictArcs.length === 0) {
-    lines.push('  No conflicts detected.');
-  } else {
-    for (const arc of narrative.conflictArcs) {
-      lines.push(formatConflictArc(arc));
+
+  // Protagonist branches
+  if (narrative.protagonistBranches.length > 0) {
+    lines.push('Protagonist Branches:');
+    lines.push('-' .repeat(20));
+    for (const arc of narrative.protagonistBranches) {
+      lines.push(`  ${arc.branchName} (${arc.classification})`);
+      lines.push(`    Lifespan: ${arc.lifespanDays.toFixed(1)} days`);
+      lines.push(`    Merges: ${arc.mergeCount}`);
+      lines.push(`    Commits: ${arc.commits.length}`);
       lines.push('');
     }
   }
-  lines.push('## Narrative');
-  for (const para of narrative.paragraphs) {
-    lines.push(para);
-    lines.push('');
+
+  // Conflict arcs
+  if (narrative.conflictArcs.length > 0) {
+    lines.push('Conflict Arcs:');
+    lines.push('-' .repeat(20));
+    for (const conflict of narrative.conflictArcs) {
+      lines.push(`  Branches: ${conflict.branches.join(', ')}`);
+      lines.push(`  Merges: ${conflict.mergeHashes.join(', ')}`);
+      lines.push(`  ${conflict.description}`);
+      lines.push('');
+    }
   }
+
+  // Stats
+  lines.push('Statistics:');
+  lines.push(`  Merge storms: ${narrative.mergeStorms}`);
+  lines.push(`  Long-lived branches: ${narrative.longLivedBranches}`);
+  lines.push(`  Refactor hotspots: ${narrative.refactorHotspots}`);
+  lines.push('');
+
+  // Paragraphs
+  if (narrative.paragraphs.length > 0) {
+    lines.push('Narrative:');
+    lines.push('-' .repeat(20));
+    for (const para of narrative.paragraphs) {
+      lines.push(para);
+      lines.push('');
+    }
+  }
+
   return lines.join('\
 ');
 }
 
-function formatMarkdown(narrative: Narrative): string {
+// ---------------------------------------------------------------------------
+// Markdown rendering
+// ---------------------------------------------------------------------------
+
+function renderMarkdown(narrative: Narrative): string {
   const lines: string[] = [];
+
   lines.push(`# ${narrative.title}`);
   lines.push('');
   lines.push(narrative.summary);
   lines.push('');
+
+  if (narrative.protagonistBranches.length > 0) {
+    lines.push('## Protagonist Branches');
+    for (const arc of narrative.protagonistBranches) {
+      lines.push(`- **${arc.branchName}** (${arc.classification})`);
+      lines.push(`  - Lifespan: ${arc.lifespanDays.toFixed(1)} days`);
+      lines.push(`  - Merges: ${arc.mergeCount}`);
+      lines.push(`  - Commits: ${arc.commits.length}`);
+    }
+    lines.push('');
+  }
+
+  if (narrative.conflictArcs.length > 0) {
+    lines.push('## Conflict Arcs');
+    for (const conflict of narrative.conflictArcs) {
+      lines.push(`- **${conflict.branches.join(' vs ')}**`);
+      lines.push(`  - Merge hashes: \`${conflict.mergeHashes.join(', ')}\``);
+      lines.push(`  - ${conflict.description}`);
+    }
+    lines.push('');
+  }
+
   lines.push('## Statistics');
-  lines.push('');
   lines.push(`- Merge storms: ${narrative.mergeStorms}`);
   lines.push(`- Long-lived branches: ${narrative.longLivedBranches}`);
   lines.push(`- Refactor hotspots: ${narrative.refactorHotspots}`);
   lines.push('');
-  lines.push('## Protagonist Branches');
-  for (const arc of narrative.protagonistBranches) {
-    lines.push(`### ${arc.branchName}`);
-    lines.push('');
-    lines.push(`- **Classification**: ${arc.classification}`);
-    lines.push(`- **Lifespan**: ${arc.lifespanDays} day(s)`);
-    lines.push(`- **Merges**: ${arc.mergeCount}`);
-    lines.push(`- **Period**: ${formatDate(arc.startDate)} → ${formatDate(arc.endDate)}`);
-    lines.push('');
-    lines.push('| Hash | Author | Date | Message |');
-    lines.push('|------|--------|------|---------|');
-    for (const c of arc.commits) {
-      lines.push(`| ${c.hash.slice(0, 7)} | ${c.author} | ${formatDate(c.date)} | ${c.message} |`);
-    }
-    lines.push('');
-  }
-  lines.push('## Conflict Arcs');
-  if (narrative.conflictArcs.length === 0) {
-    lines.push('No conflicts detected.');
-  } else {
-    for (const arc of narrative.conflictArcs) {
-      lines.push(`### Conflict`);
-      lines.push('');
-      lines.push(`- **Description**: ${arc.description}`);
-      lines.push(`- **Branches**: ${arc.branches.join(', ')}`);
-      lines.push(`- **Merge hashes**: ${arc.mergeHashes.map(h => h.slice(0, 7)).join(', ')}`);
+
+  if (narrative.paragraphs.length > 0) {
+    lines.push('## Narrative');
+    for (const para of narrative.paragraphs) {
+      lines.push(para);
       lines.push('');
     }
   }
-  lines.push('## Story');
-  for (const para of narrative.paragraphs) {
-    lines.push(para);
-    lines.push('');
-  }
+
   return lines.join('\
 ');
 }
 
 // ---------------------------------------------------------------------------
-// Slides output: renders each paragraph as a slide with animated transitions
-// Uses carriage returns and delays to simulate typing / page turning.
+// Slides rendering (animated)
 // ---------------------------------------------------------------------------
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+function renderSlide(narrative: Narrative, index: number, total: number): string {
+  const slideLines: string[] = [];
+  const header = `Slide ${index + 1} / ${total}`;
+  const separator = '-'.repeat(40);
 
-function clearScreen(): void {
-  process.stdout.write('\x1b[2J\x1b[H');
-}
+  slideLines.push(header);
+  slideLines.push(separator);
+  slideLines.push('');
 
-function typewriter(text: string, delayMs: number = 20): void {
-  for (const char of text) {
-    process.stdout.write(char);
-    // small delay between characters (simulated; we cannot actually block event loop)
-    // In a real terminal, we could use setInterval, but for simplicity we write instantly.
-  }
-}
-
-async function renderSlides(narrative: Narrative): Promise<void> {
-  clearScreen();
-  // Title slide
-  process.stdout.write(`# ${narrative.title}\
-\
-`);
-  process.stdout.write(narrative.summary + '\
-\
-');
-  process.stdout.write('Press any key to continue...\
-');
-  await waitForKeypress();
-
-  // Statistics slide
-  clearScreen();
-  process.stdout.write('## Statistics\
-\
-');
-  process.stdout.write(`Merge storms: ${narrative.mergeStorms}\
-`);
-  process.stdout.write(`Long-lived branches: ${narrative.longLivedBranches}\
-`);
-  process.stdout.write(`Refactor hotspots: ${narrative.refactorHotspots}\
-\
-`);
-  process.stdout.write('Press any key to continue...\
-');
-  await waitForKeypress();
-
-  // Branch slides
-  for (const arc of narrative.protagonistBranches) {
-    clearScreen();
-    process.stdout.write(`## Branch: ${arc.branchName}\
-\
-`);
-    process.stdout.write(`Classification: ${arc.classification}\
-`);
-    process.stdout.write(`Lifespan: ${arc.lifespanDays} day(s)\
-`);
-    process.stdout.write(`Merges: ${arc.mergeCount}\
-`);
-    process.stdout.write(`Period: ${formatDate(arc.startDate)} → ${formatDate(arc.endDate)}\
-\
-`);
-    process.stdout.write('Commits:\
-');
-    for (const c of arc.commits) {
-      process.stdout.write(`${c.hash.slice(0, 7)} | ${c.author} | ${formatDate(c.date)} | ${c.message}\
-`);
+  if (index === 0) {
+    // Title slide
+    slideLines.push(narrative.title);
+    slideLines.push('');
+    slideLines.push(narrative.summary);
+  } else if (index === 1) {
+    // Branches slide
+    slideLines.push('Protagonist Branches:');
+    for (const arc of narrative.protagonistBranches) {
+      slideLines.push(`  - ${arc.branchName} (${arc.classification}, ${arc.lifespanDays.toFixed(1)} days)`);
     }
-    process.stdout.write('\
-Press any key to continue...\
-');
-    await waitForKeypress();
+  } else if (index === 2) {
+    // Conflict slide
+    slideLines.push('Conflict Arcs:');
+    for (const conflict of narrative.conflictArcs) {
+      slideLines.push(`  - ${conflict.branches.join(', ')}: ${conflict.description}`);
+    }
+  } else if (index === 3) {
+    // Stats slide
+    slideLines.push('Statistics:');
+    slideLines.push(`  Merge storms: ${narrative.mergeStorms}`);
+    slideLines.push(`  Long-lived branches: ${narrative.longLivedBranches}`);
+    slideLines.push(`  Refactor hotspots: ${narrative.refactorHotspots}`);
+  } else if (index === 4) {
+    // Narrative paragraphs slide (first paragraph)
+    if (narrative.paragraphs.length > 0) {
+      slideLines.push(narrative.paragraphs[0]);
+    }
+  } else if (index === 5) {
+    // Second paragraph if exists
+    if (narrative.paragraphs.length > 1) {
+      slideLines.push(narrative.paragraphs[1]);
+    }
+  } else {
+    // Remaining paragraphs
+    const paraIndex = index - 4;
+    if (paraIndex < narrative.paragraphs.length) {
+      slideLines.push(narrative.paragraphs[paraIndex]);
+    } else {
+      slideLines.push('(End of narrative)');
+    }
   }
+
+  slideLines.push('');
+  slideLines.push('Press Ctrl+C to exit.');
+
+  return slideLines.join('\
+');
+}
+
+function totalSlides(narrative: Narrative): number {
+  // title + branches + conflicts + stats + paragraphs (each as a slide)
+  return 4 + narrative.paragraphs.length;
+}
