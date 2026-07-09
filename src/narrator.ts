@@ -1,13 +1,10 @@
-// ---------------------------------------------------------------------------
-// Narrator — generates a human-readable story from the commit graph
-// ---------------------------------------------------------------------------
-
 import { CommitGraph, CommitNode } from './parser.js';
-import { RankedCommit } from './ranker.js';
-import { CommitType, classifyCommit } from './classifier.js';
+import { rankCommits, RankedCommit } from './ranker.js';
+import { classifyCommit, CommitType } from './classifier.js';
+import { Config, DEFAULT_CONFIG } from './config.js';
 
 // ---------------------------------------------------------------------------
-// Types
+// Narrative types
 // ---------------------------------------------------------------------------
 
 export interface BranchArc {
@@ -16,6 +13,26 @@ export interface BranchArc {
   startDate: Date;
   endDate: Date;
   mergeCount: number;
+  classification?: string; // e.g., 'feature', 'bugfix', 'refactor', 'chore'
+}
+
+export interface ConflictArc {
+  branches: string[];
+  mergeCommits: RankedCommit[];
+  description: string;
+}
+
+export interface MergeStorm {
+  date: Date;
+  mergeCount: number;
+  branches: string[];
+}
+
+export interface RefactorHotspot {
+  filePattern?: string;
+  commitCount: number;
+  authors: string[];
+  dateRange: { start: Date; end: Date };
 }
 
 export interface Narrative {
@@ -23,179 +40,128 @@ export interface Narrative {
   summary: string;
   protagonistBranches: BranchArc[];
   conflictArcs: ConflictArc[];
-  refactorHotspots: RefactorHotspot[];
   mergeStorms: MergeStorm[];
-}
-
-export interface ConflictArc {
-  branchA: string;
-  branchB: string;
-  conflictCount: number;
-  description: string;
-}
-
-export interface RefactorHotspot {
-  file: string;
-  refactorCount: number;
-  authors: string[];
-}
-
-export interface MergeStorm {
-  date: Date;
-  mergeCount: number;
-  branches: string[];
-  description: string;
+  refactorHotspots: RefactorHotspot[];
+  totalCommits: number;
+  totalBranches: number;
+  dateRange: { start: Date; end: Date };
 }
 
 // ---------------------------------------------------------------------------
-// Configuration for narrative generation
+// Helper: compute branch classification based on commit types
 // ---------------------------------------------------------------------------
 
-export interface NarratorConfig {
-  maxProtagonists: number;
-  longLivedThresholdDays: number;
-  refactorWeight: number;
-  detectConflicts: boolean;
-  detectHotspots: boolean;
-  detectMergeStorms: boolean;
-  mergeStormWindowHours: number;
-  mergeStormThreshold: number;
-  classifyBranches: boolean;
-}
-
-export const DEFAULT_NARRATOR_CONFIG: NarratorConfig = {
-  maxProtagonists: 3,
-  longLivedThresholdDays: 30,
-  refactorWeight: 1.5,
-  detectConflicts: true,
-  detectHotspots: true,
-  detectMergeStorms: true,
-  mergeStormWindowHours: 6,
-  mergeStormThreshold: 3,
-  classifyBranches: true,
-};
-
-// ---------------------------------------------------------------------------
-// Helper: build a map from hash to CommitNode
-// ---------------------------------------------------------------------------
-
-function buildCommitMap(commits: CommitNode[]): Map<string, CommitNode> {
-  const map = new Map<string, CommitNode>();
+function classifyBranch(commits: RankedCommit[]): string {
+  const typeCounts: Record<string, number> = {};
   for (const c of commits) {
-    map.set(c.hash, c);
+    const type = classifyCommit(c.message);
+    typeCounts[type] = (typeCounts[type] || 0) + 1;
   }
-  return map;
-}
-
-// ---------------------------------------------------------------------------
-// Helper: classify all commits
-// ---------------------------------------------------------------------------
-
-function classifyCommits(commits: CommitNode[]): Map<string, CommitType> {
-  const map = new Map<string, CommitType>();
-  for (const c of commits) {
-    map.set(c.hash, classifyCommit(c));
-  }
-  return map;
-}
-
-// ---------------------------------------------------------------------------
-// Helper: detect merge storms
-// ---------------------------------------------------------------------------
-
-function detectMergeStorms(
-  commits: CommitNode[],
-  windowHours: number,
-  threshold: number
-): MergeStorm[] {
-  if (commits.length === 0) return [];
-
-  // Filter merge commits
-  const mergeCommits = commits.filter((c) => c.isMerge);
-  if (mergeCommits.length < threshold) return [];
-
-  // Sort by date ascending
-  const sorted = [...mergeCommits].sort((a, b) => a.date.getTime() - b.date.getTime());
-
-  const storms: MergeStorm[] = [];
-  let i = 0;
-  while (i < sorted.length) {
-    const windowStart = sorted[i].date.getTime();
-    const windowEnd = windowStart + windowHours * 60 * 60 * 1000;
-    const windowCommits: CommitNode[] = [];
-    let j = i;
-    while (j < sorted.length && sorted[j].date.getTime() <= windowEnd) {
-      windowCommits.push(sorted[j]);
-      j++;
-    }
-    if (windowCommits.length >= threshold) {
-      const branchSet = new Set<string>();
-      for (const mc of windowCommits) {
-        for (const b of mc.branches) {
-          branchSet.add(b);
-        }
-      }
-      const branches = Array.from(branchSet).sort();
-      const description = `Merge storm detected: ${windowCommits.length} merge commits within ${windowHours} hours involving ${branches.length} branches.`;
-      storms.push({
-        date: windowCommits[0].date,
-        mergeCount: windowCommits.length,
-        branches,
-        description,
-      });
-      i = j; // move past this window
-    } else {
-      i++;
+  // Determine dominant type (excluding unknown)
+  let dominantType = 'unknown';
+  let maxCount = 0;
+  for (const [type, count] of Object.entries(typeCounts)) {
+    if (type !== CommitType.UNKNOWN && count > maxCount) {
+      maxCount = count;
+      dominantType = type;
     }
   }
-  return storms;
+  // Map to user-friendly label
+  const labelMap: Record<string, string> = {
+    [CommitType.FEAT]: 'feature',
+    [CommitType.FIX]: 'bugfix',
+    [CommitType.REFACTOR]: 'refactor',
+    [CommitType.CHORE]: 'chore',
+    [CommitType.DOCS]: 'documentation',
+    [CommitType.STYLE]: 'style',
+    [CommitType.PERF]: 'performance',
+    [CommitType.TEST]: 'testing',
+    [CommitType.CI]: 'ci',
+    [CommitType.BUILD]: 'build',
+    [CommitType.REVERT]: 'revert',
+    [CommitType.MERGE]: 'merge',
+  };
+  return labelMap[dominantType] || 'unknown';
 }
 
 // ---------------------------------------------------------------------------
-// Helper: detect conflict arcs from merge commits with multiple parents
+// Helper: detect conflict arcs from merge commits
 // ---------------------------------------------------------------------------
 
 function detectConflictArcs(
-  commits: CommitNode[],
-  commitMap: Map<string, CommitNode>
+  rankedCommits: Map<string, RankedCommit>,
+  graph: CommitGraph
 ): ConflictArc[] {
-  const conflictPairs = new Map<string, number>(); // key: "branchA|branchB"
-
-  for (const c of commits) {
-    if (c.parents.length >= 2) {
-      // It's a merge commit — get branches of parents
-      const parentBranches: string[] = [];
-      for (const parentHash of c.parents) {
-        const parent = commitMap.get(parentHash);
-        if (parent && parent.branches.length > 0) {
-          // Use the first branch as representative
-          parentBranches.push(parent.branches[0]);
-        }
+  const arcs: ConflictArc[] = [];
+  // Look for merge commits with multiple parents from different branches
+  for (const [hash, node] of graph.commits) {
+    if (node.parents.length < 2) continue;
+    // Identify distinct branch origins
+    const parentBranches = new Set<string>();
+    for (const parentHash of node.parents) {
+      const parentNode = graph.commits.get(parentHash);
+      if (parentNode && parentNode.branches.length > 0) {
+        // Use the first branch as representative
+        parentBranches.add(parentNode.branches[0]);
       }
-      // If we have at least two distinct branches
-      const uniqueBranches = Array.from(new Set(parentBranches)).sort();
-      if (uniqueBranches.length >= 2) {
-        for (let i = 0; i < uniqueBranches.length; i++) {
-          for (let j = i + 1; j < uniqueBranches.length; j++) {
-            const key = `${uniqueBranches[i]}|${uniqueBranches[j]}`;
-            conflictPairs.set(key, (conflictPairs.get(key) || 0) + 1);
-          }
-        }
+    }
+    if (parentBranches.size >= 2) {
+      const mergeCommit = rankedCommits.get(hash);
+      if (mergeCommit) {
+        arcs.push({
+          branches: Array.from(parentBranches),
+          mergeCommits: [mergeCommit],
+          description: `Merge of ${Array.from(parentBranches).join(' and ')} at commit ${hash.slice(0,7)}`,
+        });
       }
     }
   }
+  return arcs;
+}
 
-  const arcs: ConflictArc[] = [];
-  for (const [key, count] of conflictPairs.entries()) {
-    const [branchA, branchB] = key.split('|');
-    arcs.push({
-      branchA,
-      branchB,
-      conflictCount: count,
-      description: `Branch '${branchA}' and '${branchB}' have been merged ${count} time(s), indicating recurring integration points.`,
-    });
+// ---------------------------------------------------------------------------
+// Helper: detect merge storms (periods with many merges)
+// ---------------------------------------------------------------------------
+
+function detectMergeStorms(
+  rankedCommits: RankedCommit[],
+  windowHours: number = 24,
+  threshold: number = 3
+): MergeStorm[] {
+  const storms: MergeStorm[] = [];
+  const merges = rankedCommits.filter(c => c.message.startsWith('merge') || c.message.startsWith('Merge'));
+  if (merges.length === 0) return storms;
+
+  // Sort by date
+  const sorted = [...merges].sort((a, b) => a.date.getTime() - b.date.getTime());
+
+  let windowStart = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    while (sorted[i].date.getTime() - sorted[windowStart].date.getTime() > windowHours * 60 * 60 * 1000) {
+      windowStart++;
+    }
+    const windowCount = i - windowStart + 1;
+    if (windowCount >= threshold) {
+      // Check if we already have a storm at this date (avoid duplicates)
+      const existing = storms.find(s =>
+        Math.abs(s.date.getTime() - sorted[i].date.getTime()) < 60 * 60 * 1000
+      );
+      if (!existing) {
+        const branchSet = new Set<string>();
+        for (let j = windowStart; j <= i; j++) {
+          for (const b of sorted[j].branches) {
+            branchSet.add(b);
+          }
+        }
+        storms.push({
+          date: sorted[i].date,
+          mergeCount: windowCount,
+          branches: Array.from(branchSet),
+        });
+      }
+    }
   }
-  return arcs.sort((a, b) => b.conflictCount - a.conflictCount);
+  return storms;
 }
 
 // ---------------------------------------------------------------------------
@@ -203,29 +169,52 @@ function detectConflictArcs(
 // ---------------------------------------------------------------------------
 
 function detectRefactorHotspots(
-  commits: CommitNode[],
-  classified: Map<string, CommitType>
+  rankedCommits: RankedCommit[],
+  threshold: number = 3
 ): RefactorHotspot[] {
-  const fileMap = new Map<string, { count: number; authors: Set<string> }>();
+  const hotspots: RefactorHotspot[] = [];
+  const refactorCommits = rankedCommits.filter(c => {
+    const type = classifyCommit(c.message);
+    return type === CommitType.REFACTOR;
+  });
 
-  for (const c of commits) {
-    const type = classified.get(c.hash);
-    if (type === CommitType.REFACTOR) {
-      // We don't have file-level info from the commit log directly,
-      // so we approximate by counting refactor commits per author and per branch
-      // In a full implementation, we would parse diff stats.
-      // For now, we use a heuristic: count refactor commits and group by branch.
-      for (const branch of c.branches) {
-        const key = branch;
-        if (!fileMap.has(key)) {
-          fileMap.set(key, { count: 0, authors: new Set() });
-        }
-        const entry = fileMap.get(key)!;
-        entry.count++;
-        entry.authors.add(c.author);
-      }
+  if (refactorCommits.length < threshold) return hotspots;
+
+  // Group by author (simple heuristic: if multiple refactors by same author in close proximity)
+  const authorGroups: Map<string, RankedCommit[]> = new Map();
+  for (const c of refactorCommits) {
+    const group = authorGroups.get(c.author) || [];
+    group.push(c);
+    authorGroups.set(c.author, group);
+  }
+
+  for (const [author, commits] of authorGroups) {
+    if (commits.length >= threshold) {
+      const sorted = commits.sort((a, b) => a.date.getTime() - b.date.getTime());
+      hotspots.push({
+        commitCount: commits.length,
+        authors: [author],
+        dateRange: {
+          start: sorted[0].date,
+          end: sorted[sorted.length - 1].date,
+        },
+      });
     }
   }
 
-  const hotspots: RefactorHotspot[] = [];
-  for (const [file, { count, authors }
+  return hotspots;
+}
+
+// ---------------------------------------------------------------------------
+// Main narrative generation
+// ---------------------------------------------------------------------------
+
+export function generateNarrative(
+  graph: CommitGraph,
+  config: Config = DEFAULT_CONFIG
+): Narrative {
+  const ranked = rankCommits(graph);
+  const rankedMap = new Map<string, RankedCommit>();
+  for (const c of ranked) {
+    rankedMap.set(c.hash, c);
+  }
