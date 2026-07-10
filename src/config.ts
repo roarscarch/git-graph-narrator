@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Configuration module — load, validate, and expose user settings
+// Configuration module — loads and validates config from file and environment
 // ---------------------------------------------------------------------------
 
 import fs from 'fs';
@@ -7,10 +7,10 @@ import path from 'path';
 import { cosmiconfig } from 'cosmiconfig';
 
 /**
- * Supported output formats.
+ * Output format for the narrative.
  */
 export enum OutputFormat {
-  PLAIN = 'plain',
+  TEXT = 'text',
   MARKDOWN = 'markdown',
   SLIDES = 'slides',
 }
@@ -19,136 +19,185 @@ export enum OutputFormat {
  * Configuration interface for git-graph-narrator.
  */
 export interface Config {
-  /** Git repository path (default: current working directory) */
+  /** Repository path (default: cwd) */
   repoPath: string;
   /** Output format */
   outputFormat: OutputFormat;
-  /** Include merge commits in the narrative */
+  /** Maximum number of commits to analyze (0 = unlimited) */
+  maxCommits: number;
+  /** Include merge commits in narrative */
   includeMerges: boolean;
-  /** Maximum number of protagonist branches to highlight */
-  maxProtagonistBranches: number;
-  /** Minimum weight threshold for a commit to be considered a plot point */
-  plotPointThreshold: number;
-  /** Whether to colorize output (for plain text) */
-  colorize: boolean;
-  /** Slide transition interval in milliseconds (for slides format) */
-  slideIntervalMs: number;
+  /** Minimum weight for a commit to appear in story */
+  minWeight: number;
+  /** Color output enabled */
+  color: boolean;
   /** Verbose logging */
   verbose: boolean;
+  /** Custom git log format string */
+  gitLogFormat: string;
+  /** Branch patterns to treat as protagonists */
+  protagonistPatterns: string[];
+  /** Ignore branches matching these patterns */
+  ignoreBranchPatterns: string[];
 }
 
 /**
  * Default configuration values.
  */
-const DEFAULT_CONFIG: Config = {
+export const DEFAULT_CONFIG: Config = {
   repoPath: process.cwd(),
-  outputFormat: OutputFormat.PLAIN,
+  outputFormat: OutputFormat.TEXT,
+  maxCommits: 1000,
   includeMerges: true,
-  maxProtagonistBranches: 3,
-  plotPointThreshold: 1.0,
-  colorize: true,
-  slideIntervalMs: 3000,
+  minWeight: 0.5,
+  color: true,
   verbose: false,
+  gitLogFormat: '--format=%H||%an||%ae||%aI||%s||%P||%D',
+  protagonistPatterns: ['main', 'master', 'develop'],
+  ignoreBranchPatterns: [],
 };
 
 /**
- * Attempt to load configuration from a config file.
- * Supported files: .gitgraphnarratorrc, .gitgraphnarratorrc.json, .gitgraphnarratorrc.yaml,
- *   .gitgraphnarratorrc.yml, .gitgraphnarratorrc.js, git-graph-narrator.config.js
- * Also checks the "gitGraphNarrator" key in package.json.
+ * Validate a partial config object, filling defaults and returning a full Config.
+ * Throws on invalid values.
  */
-export async function loadConfig(customPath?: string): Promise<Config> {
-  const explorer = cosmiconfig('gitGraphNarrator', {
+export function validateConfig(raw: Partial<Config>): Config {
+  const config: Config = { ...DEFAULT_CONFIG, ...raw };
+
+  // Validate repoPath
+  if (typeof config.repoPath !== 'string' || config.repoPath.trim() === '') {
+    throw new Error('repoPath must be a non-empty string');
+  }
+  // Resolve relative paths
+  config.repoPath = path.resolve(config.repoPath);
+  if (!fs.existsSync(config.repoPath)) {
+    throw new Error(`repoPath does not exist: ${config.repoPath}`);
+  }
+
+  // Validate outputFormat
+  const validFormats = Object.values(OutputFormat);
+  if (!validFormats.includes(config.outputFormat as OutputFormat)) {
+    throw new Error(`outputFormat must be one of: ${validFormats.join(', ')}`);
+  }
+
+  // Validate maxCommits
+  if (typeof config.maxCommits !== 'number' || config.maxCommits < 0 || !Number.isInteger(config.maxCommits)) {
+    throw new Error('maxCommits must be a non-negative integer');
+  }
+
+  // Validate includeMerges
+  if (typeof config.includeMerges !== 'boolean') {
+    throw new Error('includeMerges must be a boolean');
+  }
+
+  // Validate minWeight
+  if (typeof config.minWeight !== 'number' || config.minWeight < 0) {
+    throw new Error('minWeight must be a non-negative number');
+  }
+
+  // Validate color
+  if (typeof config.color !== 'boolean') {
+    throw new Error('color must be a boolean');
+  }
+
+  // Validate verbose
+  if (typeof config.verbose !== 'boolean') {
+    throw new Error('verbose must be a boolean');
+  }
+
+  // Validate gitLogFormat
+  if (typeof config.gitLogFormat !== 'string' || config.gitLogFormat.trim() === '') {
+    throw new Error('gitLogFormat must be a non-empty string');
+  }
+
+  // Validate protagonistPatterns
+  if (!Array.isArray(config.protagonistPatterns) || config.protagonistPatterns.some(p => typeof p !== 'string')) {
+    throw new Error('protagonistPatterns must be an array of strings');
+  }
+
+  // Validate ignoreBranchPatterns
+  if (!Array.isArray(config.ignoreBranchPatterns) || config.ignoreBranchPatterns.some(p => typeof p !== 'string')) {
+    throw new Error('ignoreBranchPatterns must be an array of strings');
+  }
+
+  return config;
+}
+
+/**
+ * Load configuration from file and environment variables.
+ * File config takes precedence over defaults; env vars override file config.
+ */
+export async function loadConfig(configPath?: string): Promise<Config> {
+  // Start with defaults
+  const config: Config = { ...DEFAULT_CONFIG };
+
+  // Load from config file using cosmiconfig
+  const explorer = cosmiconfig('git-graph-narrator', {
     searchPlaces: [
-      'package.json',
-      '.gitgraphnarratorrc',
-      '.gitgraphnarratorrc.json',
-      '.gitgraphnarratorrc.yaml',
-      '.gitgraphnarratorrc.yml',
-      '.gitgraphnarratorrc.js',
+      '.git-graph-narratorrc',
+      '.git-graph-narratorrc.json',
+      '.git-graph-narratorrc.yaml',
+      '.git-graph-narratorrc.yml',
+      '.git-graph-narratorrc.js',
       'git-graph-narrator.config.js',
+      'package.json',
     ],
   });
 
-  let result;
-  if (customPath) {
-    result = await explorer.load(customPath);
-  } else {
-    result = await explorer.search();
-  }
-
-  if (result && !result.isEmpty) {
-    const userConfig = result.config as Partial<Config>;
-    const merged = { ...DEFAULT_CONFIG, ...userConfig };
-    validateConfig(merged);
-    return merged;
-  }
-
-  return DEFAULT_CONFIG;
-}
-
-/**
- * Validate the configuration object and throw on invalid values.
- */
-function validateConfig(config: Config): void {
-  if (!config.repoPath || typeof config.repoPath !== 'string') {
-    throw new Error('config.repoPath must be a non-empty string');
-  }
-
-  if (!Object.values(OutputFormat).includes(config.outputFormat)) {
-    throw new Error(
-      `config.outputFormat must be one of: ${Object.values(OutputFormat).join(', ')}`
-    );
-  }
-
-  if (typeof config.includeMerges !== 'boolean') {
-    throw new Error('config.includeMerges must be a boolean');
-  }
-
-  if (!Number.isInteger(config.maxProtagonistBranches) || config.maxProtagonistBranches < 1) {
-    throw new Error('config.maxProtagonistBranches must be a positive integer');
-  }
-
-  if (typeof config.plotPointThreshold !== 'number' || config.plotPointThreshold < 0) {
-    throw new Error('config.plotPointThreshold must be a non-negative number');
-  }
-
-  if (typeof config.colorize !== 'boolean') {
-    throw new Error('config.colorize must be a boolean');
-  }
-
-  if (!Number.isInteger(config.slideIntervalMs) || config.slideIntervalMs < 100) {
-    throw new Error('config.slideIntervalMs must be an integer >= 100');
-  }
-
-  if (typeof config.verbose !== 'boolean') {
-    throw new Error('config.verbose must be a boolean');
-  }
-}
-
-/**
- * Quick synchronous config load for CLI (no cosmiconfig async).
- * Only reads from a JSON file directly.
- */
-export function loadConfigSync(customPath?: string): Config {
-  if (!customPath) {
-    return DEFAULT_CONFIG;
-  }
-
-  const resolved = path.resolve(customPath);
-  if (!fs.existsSync(resolved)) {
-    throw new Error(`Config file not found: ${resolved}`);
-  }
-
-  const raw = fs.readFileSync(resolved, 'utf-8');
-  let userConfig: Partial<Config>;
   try {
-    userConfig = JSON.parse(raw);
-  } catch {
-    throw new Error(`Invalid JSON in config file: ${resolved}`);
+    const result = configPath
+      ? await explorer.load(configPath)
+      : await explorer.search();
+
+    if (result && !result.isEmpty) {
+      Object.assign(config, result.config);
+    }
+  } catch (error) {
+    // If no config file found, continue with defaults
+    if (configPath && !(error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw error;
+    }
   }
 
-  const merged = { ...DEFAULT_CONFIG, ...userConfig };
-  validateConfig(merged);
-  return merged;
+  // Override with environment variables
+  const envMap: Record<string, keyof Config> = {
+    GGN_REPO_PATH: 'repoPath',
+    GGN_OUTPUT_FORMAT: 'outputFormat',
+    GGN_MAX_COMMITS: 'maxCommits',
+    GGN_INCLUDE_MERGES: 'includeMerges',
+    GGN_MIN_WEIGHT: 'minWeight',
+    GGN_COLOR: 'color',
+    GGN_VERBOSE: 'verbose',
+    GGN_GIT_LOG_FORMAT: 'gitLogFormat',
+    GGN_PROTAGONIST_PATTERNS: 'protagonistPatterns',
+    GGN_IGNORE_BRANCH_PATTERNS: 'ignoreBranchPatterns',
+  };
+
+  for (const [envVar, configKey] of Object.entries(envMap)) {
+    const envValue = process.env[envVar];
+    if (envValue !== undefined) {
+      switch (configKey) {
+        case 'maxCommits':
+          config[configKey] = parseInt(envValue, 10);
+          break;
+        case 'includeMerges':
+        case 'color':
+        case 'verbose':
+          config[configKey] = envValue.toLowerCase() === 'true' || envValue === '1';
+          break;
+        case 'minWeight':
+          config[configKey] = parseFloat(envValue);
+          break;
+        case 'protagonistPatterns':
+        case 'ignoreBranchPatterns':
+          config[configKey] = envValue.split(',').map(s => s.trim());
+          break;
+        default:
+          (config as Record<string, unknown>)[configKey] = envValue;
+      }
+    }
+  }
+
+  // Validate final config
+  return validateConfig(config);
 }
