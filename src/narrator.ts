@@ -1,192 +1,188 @@
-import { CommitGraph, CommitNode } from './parser.js';
-import { classifyBranch, BranchProfile, BranchRole } from './branch-classifier.js';
-import { CommitType } from './classifier.js';
-
-/**
- * A merge storm is defined as a period (in days) where merge commits occur at a high frequency.
- */
-export interface MergeStorm {
-  startDate: Date;
-  endDate: Date;
-  mergeCount: number;
-  branchesInvolved: string[];
-  description: string;
-}
+import { CommitGraph, CommitNode, Edge } from './parser.js';
+import { CommitType, classifyCommit } from './classifier.js';
+import { BranchRole, classifyBranch, BranchProfile } from './branch-classifier.js';
 
 export interface Narrative {
   title: string;
   summary: string;
-  protagonistBranches: BranchProfile[];
+  protagonistBranches: BranchNarrative[];
+  conflictArcs: ConflictArc[];
   mergeStorms: MergeStorm[];
-  refactorHotspots: { branch: string; commitCount: number }[];
-  longLivedBranches: { branch: string; days: number }[];
 }
 
-/**
- * Detect merge storms from a commit graph.
- * A merge storm is detected when there are more than `threshold` merges within `windowDays` days.
- */
-export function detectMergeStorms(
-  graph: CommitGraph,
-  windowDays: number = 7,
-  threshold: number = 5
-): MergeStorm[] {
-  const mergeCommits = graph.commits.filter(
-    (c) => c.type === CommitType.MERGE
-  );
-  if (mergeCommits.length === 0) return [];
-
-  // Sort by date
-  mergeCommits.sort((a, b) => a.date.getTime() - b.date.getTime());
-
-  const storms: MergeStorm[] = [];
-  let i = 0;
-  while (i < mergeCommits.length) {
-    const start = mergeCommits[i];
-    const windowEnd = new Date(start.date.getTime() + windowDays * 24 * 60 * 60 * 1000);
-    const cluster: CommitNode[] = [start];
-    let j = i + 1;
-    while (j < mergeCommits.length && mergeCommits[j].date <= windowEnd) {
-      cluster.push(mergeCommits[j]);
-      j++;
-    }
-    if (cluster.length >= threshold) {
-      const branches = new Set<string>();
-      cluster.forEach((c) => c.branches.forEach((b) => branches.add(b)));
-      storms.push({
-        startDate: cluster[0].date,
-        endDate: cluster[cluster.length - 1].date,
-        mergeCount: cluster.length,
-        branchesInvolved: Array.from(branches),
-        description: `Merge storm: ${cluster.length} merges in ${windowDays} days involving ${branches.size} branches`,
-      });
-      i = j; // skip ahead
-    } else {
-      i++;
-    }
-  }
-  return storms;
+export interface BranchNarrative {
+  branchName: string;
+  role: BranchRole;
+  commits: CommitNode[];
+  startDate: Date;
+  endDate: Date;
+  mergeCount: number;
 }
 
-/**
- * Identify long-lived branches (branches that existed for more than `maxDays` days).
- */
-export function findLongLivedBranches(
-  graph: CommitGraph,
-  maxDays: number = 30
-): { branch: string; days: number }[] {
-  const branchDates: Map<string, { first: Date; last: Date }> = new Map();
+export interface ConflictArc {
+  description: string;
+  branches: string[];
+  commitCount: number;
+}
+
+export interface MergeStorm {
+  timeRange: { start: Date; end: Date };
+  mergeCount: number;
+  branches: string[];
+  description: string;
+}
+
+export function buildNarrative(graph: CommitGraph): Narrative {
+  const branchMap = new Map<string, CommitNode[]>();
   for (const commit of graph.commits) {
     for (const branch of commit.branches) {
-      const existing = branchDates.get(branch);
-      if (existing) {
-        if (commit.date < existing.first) existing.first = commit.date;
-        if (commit.date > existing.last) existing.last = commit.date;
-      } else {
-        branchDates.set(branch, { first: commit.date, last: commit.date });
+      if (!branchMap.has(branch)) {
+        branchMap.set(branch, []);
       }
+      branchMap.get(branch)!.push(commit);
     }
   }
-  const longLived: { branch: string; days: number }[] = [];
-  for (const [branch, dates] of branchDates) {
-    const days = (dates.last.getTime() - dates.first.getTime()) / (1000 * 60 * 60 * 24);
-    if (days > maxDays) {
-      longLived.push({ branch, days: Math.round(days) });
-    }
-  }
-  return longLived;
-}
 
-/**
- * Identify refactor hotspots: branches with many refactor commits.
- */
-export function findRefactorHotspots(
-  graph: CommitGraph,
-  minRefactorCount: number = 3
-): { branch: string; commitCount: number }[] {
-  const branchRefactorCounts: Map<string, number> = new Map();
-  for (const commit of graph.commits) {
-    if (commit.type === CommitType.REFACTOR) {
-      for (const branch of commit.branches) {
-        branchRefactorCounts.set(
-          branch,
-          (branchRefactorCounts.get(branch) || 0) + 1
-        );
-      }
-    }
-  }
-  const hotspots: { branch: string; commitCount: number }[] = [];
-  for (const [branch, count] of branchRefactorCounts) {
-    if (count >= minRefactorCount) {
-      hotspots.push({ branch, commitCount: count });
-    }
-  }
-  return hotspots;
-}
-
-/**
- * Build a full narrative from the commit graph.
- */
-export function buildNarrative(graph: CommitGraph): Narrative {
-  // Classify each branch
-  const branchNames = new Set<string>();
-  graph.commits.forEach((c) => c.branches.forEach((b) => branchNames.add(b)));
-  const profiles: BranchProfile[] = [];
-  for (const branchName of branchNames) {
-    const branchCommits = graph.commits.filter((c) =>
-      c.branches.includes(branchName)
-    );
-    const profile = classifyBranch(branchCommits, branchName);
-    profiles.push(profile);
+  const branchProfiles: BranchProfile[] = [];
+  for (const [branchName, commits] of branchMap) {
+    const profile = classifyBranch(commits, branchName);
+    branchProfiles.push(profile);
   }
 
-  // Sort profiles: main first, then by totalCommits descending
-  profiles.sort((a, b) => {
-    if (a.role === BranchRole.MAIN) return -1;
-    if (b.role === BranchRole.MAIN) return 1;
-    return b.totalCommits - a.totalCommits;
-  });
+  const protagonistBranches: BranchNarrative[] = branchProfiles.map(profile => ({
+    branchName: profile.branchName,
+    role: profile.role,
+    commits: profile.commits,
+    startDate: profile.commits.length > 0 ? profile.commits[0].date : new Date(),
+    endDate: profile.commits.length > 0 ? profile.commits[profile.commits.length - 1].date : new Date(),
+    mergeCount: graph.edges.filter(e => e.target === profile.branchName && e.type === 'merge').length,
+  }));
 
-  // Detect merge storms
+  const conflictArcs = detectConflicts(graph, branchProfiles);
   const mergeStorms = detectMergeStorms(graph);
 
-  // Find long-lived branches
-  const longLivedBranches = findLongLivedBranches(graph);
-
-  // Find refactor hotspots
-  const refactorHotspots = findRefactorHotspots(graph);
-
-  // Build summary
-  let summary = '';
-  const mainProfile = profiles.find((p) => p.role === BranchRole.MAIN);
-  if (mainProfile) {
-    summary = `The epic of ${mainProfile.branchName}: `;
-    summary += `${mainProfile.totalCommits} commits over ${profiles.length} branches. `;
-    const featureBranches = profiles.filter((p) => p.role === BranchRole.FEATURE);
-    if (featureBranches.length > 0) {
-      summary += `${featureBranches.length} feature branches contributed to the plot. `;
-    }
-    if (mergeStorms.length > 0) {
-      summary += `${mergeStorms.length} merge storm${mergeStorms.length > 1 ? 's' : ''} detected. `;
-    }
-    if (longLivedBranches.length > 0) {
-      summary += `${longLivedBranches.length} long-lived branch${longLivedBranches.length > 1 ? 'es' : ''} found. `;
-    }
-    if (refactorHotspots.length > 0) {
-      summary += `${refactorHotspots.length} refactor hotspot${refactorHotspots.length > 1 ? 's' : ''} identified.`;
-    }
-  } else {
-    summary = 'No main branch found. The story is fragmented.';
-  }
-
-  const title = `The Epic of ${mainProfile ? mainProfile.branchName : 'Git'}`;
+  const title = generateTitle(protagonistBranches, conflictArcs);
+  const summary = generateSummary(protagonistBranches, conflictArcs, mergeStorms);
 
   return {
     title,
     summary,
-    protagonistBranches: profiles,
+    protagonistBranches,
+    conflictArcs,
     mergeStorms,
-    refactorHotspots,
-    longLivedBranches,
   };
+}
+
+function detectConflicts(graph: CommitGraph, profiles: BranchProfile[]): ConflictArc[] {
+  const arcs: ConflictArc[] = [];
+  // Simple heuristic: branches that merged into main within a short time window
+  const mergeEdges = graph.edges.filter(e => e.type === 'merge');
+  const timeWindows = new Map<string, { start: Date; end: Date; branches: string[] }>();
+  for (const edge of mergeEdges) {
+    const commit = graph.commits.find(c => c.hash === edge.source);
+    if (!commit) continue;
+    const windowKey = `${edge.source}-${edge.target}`;
+    const existing = timeWindows.get(windowKey);
+    if (existing) {
+      existing.branches.push(edge.target);
+    } else {
+      timeWindows.set(windowKey, {
+        start: commit.date,
+        end: commit.date,
+        branches: [edge.target],
+      });
+    }
+  }
+
+  for (const [, window] of timeWindows) {
+    if (window.branches.length >= 2) {
+      arcs.push({
+        description: `Branches ${window.branches.join(', ')} merged into main in quick succession, suggesting parallel development.`,
+        branches: window.branches,
+        commitCount: window.branches.length,
+      });
+    }
+  }
+
+  return arcs;
+}
+
+function detectMergeStorms(graph: CommitGraph): MergeStorm[] {
+  const storms: MergeStorm[] = [];
+  const mergeEdges = graph.edges.filter(e => e.type === 'merge');
+  if (mergeEdges.length < 3) {
+    return storms;
+  }
+
+  // Sort by date
+  const sorted = mergeEdges
+    .map(e => ({
+      edge: e,
+      commit: graph.commits.find(c => c.hash === e.source),
+    }))
+    .filter(item => item.commit !== undefined)
+    .sort((a, b) => a.commit!.date.getTime() - b.commit!.date.getTime());
+
+  // Sliding window of 24 hours
+  const WINDOW_MS = 24 * 60 * 60 * 1000;
+  let i = 0;
+  while (i < sorted.length) {
+    const windowStart = sorted[i].commit!.date;
+    let j = i + 1;
+    while (j < sorted.length && (sorted[j].commit!.date.getTime() - windowStart.getTime()) < WINDOW_MS) {
+      j++;
+    }
+    const count = j - i;
+    if (count >= 3) {
+      const uniqueBranches = new Set(sorted.slice(i, j).map(item => item.edge.target));
+      storms.push({
+        timeRange: {
+          start: sorted[i].commit!.date,
+          end: sorted[j - 1].commit!.date,
+        },
+        mergeCount: count,
+        branches: Array.from(uniqueBranches),
+        description: `Merge storm: ${count} merges involving ${uniqueBranches.size} branches within a 24-hour window.`,
+      });
+    }
+    i = j;
+  }
+
+  return storms;
+}
+
+function generateTitle(protagonists: BranchNarrative[], conflictArcs: ConflictArc[]): string {
+  if (conflictArcs.length > 0) {
+    return `The Tale of ${protagonists.filter(p => p.role === BranchRole.MAIN || p.role === BranchRole.FEATURE).map(p => p.branchName).join(', ')} and Their Conflicts`;
+  }
+  return `The Epic of ${protagonists.filter(p => p.role === BranchRole.MAIN).map(p => p.branchName).join(', ')}`;
+}
+
+function generateSummary(protagonists: BranchNarrative[], conflictArcs: ConflictArc[], mergeStorms: MergeStorm[]): string {
+  const parts: string[] = [];
+  const mainBranches = protagonists.filter(p => p.role === BranchRole.MAIN);
+  const featureBranches = protagonists.filter(p => p.role === BranchRole.FEATURE);
+  const bugfixBranches = protagonists.filter(p => p.role === BranchRole.BUGFIX);
+  const releaseBranches = protagonists.filter(p => p.role === BranchRole.RELEASE);
+
+  if (mainBranches.length > 0) {
+    parts.push(`The main branch \`${mainBranches[0].branchName}\` saw ${mainBranches[0].commits.length} commits.`);
+  }
+  if (featureBranches.length > 0) {
+    parts.push(`${featureBranches.length} feature branches contributed to the story.`);
+  }
+  if (bugfixBranches.length > 0) {
+    parts.push(`${bugfixBranches.length} bugfix branches helped stabilize the codebase.`);
+  }
+  if (releaseBranches.length > 0) {
+    parts.push(`${releaseBranches.length} release branches were prepared.`);
+  }
+  if (conflictArcs.length > 0) {
+    parts.push(`There were ${conflictArcs.length} conflict arcs.`);
+  }
+  if (mergeStorms.length > 0) {
+    parts.push(`Merge storms detected: ${mergeStorms.length}.`);
+  }
+
+  return parts.join(' ');
 }
