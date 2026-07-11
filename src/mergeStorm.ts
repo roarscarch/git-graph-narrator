@@ -1,76 +1,77 @@
-import { CommitNode } from './parser.js';
+import { CommitGraph, CommitNode } from './parser.js';
 import { CommitType } from './classifier.js';
 
 export interface MergeStorm {
   startDate: Date;
   endDate: Date;
-  branchCount: number;
-  commitCount: number;
-  branches: string[];
-  intensity: number; // 0..1 based on commit frequency
+  branch: string;
+  totalMerges: number;
+  commitsInvolved: number;
+  description: string;
 }
 
-export function detectMergeStorms(
-  commits: CommitNode[],
-  windowHours: number = 24,
-  minBranchThreshold: number = 3
-): MergeStorm[] {
-  if (commits.length === 0) return [];
+const MERGE_STORM_THRESHOLD = 3; // minimum number of merges in a short period
+const STORM_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-  const sorted = [...commits].sort((a, b) => a.date.getTime() - b.date.getTime());
+/**
+ * Detects merge storms: periods where a branch experiences an unusually high number of merges
+ * within a short time window.
+ */
+export function detectMergeStorms(graph: CommitGraph): MergeStorm[] {
   const storms: MergeStorm[] = [];
+  const branchMergeTimes: Map<string, Date[]> = new Map();
 
-  let windowStart = 0;
-  for (let i = 0; i < sorted.length; i++) {
-    const start = sorted[windowStart].date.getTime();
-    const current = sorted[i].date.getTime();
-    if (current - start > windowHours * 60 * 60 * 1000) {
-      // Process the window
-      const windowCommits = sorted.slice(windowStart, i);
-      const branches = new Set<string>();
-      let commitCount = 0;
-      for (const c of windowCommits) {
-        for (const b of c.branches) {
-          branches.add(b);
-        }
-        commitCount++;
+  for (const commit of graph.commits) {
+    if (commit.type === CommitType.MERGE) {
+      for (const branch of commit.branches) {
+        const times = branchMergeTimes.get(branch) || [];
+        times.push(commit.date);
+        branchMergeTimes.set(branch, times);
       }
-      if (branches.size >= minBranchThreshold) {
-        storms.push({
-          startDate: new Date(start),
-          endDate: new Date(current),
-          branchCount: branches.size,
-          commitCount,
-          branches: Array.from(branches),
-          intensity: Math.min(1, commitCount / (branches.size * 2)),
-        });
-      }
-      windowStart = i;
     }
   }
 
-  // Handle last window
-  const lastWindow = sorted.slice(windowStart);
-  if (lastWindow.length > 0) {
-    const branches = new Set<string>();
-    let commitCount = 0;
-    for (const c of lastWindow) {
-      for (const b of c.branches) {
-        branches.add(b);
+  for (const [branch, times] of branchMergeTimes.entries()) {
+    if (times.length < MERGE_STORM_THRESHOLD) continue;
+
+    // Sort times in ascending order
+    times.sort((a, b) => a.getTime() - b.getTime());
+
+    let windowStart = 0;
+    while (windowStart <= times.length - MERGE_STORM_THRESHOLD) {
+      const windowEnd = windowStart + MERGE_STORM_THRESHOLD - 1;
+      const timeSpan = times[windowEnd].getTime() - times[windowStart].getTime();
+      if (timeSpan <= STORM_WINDOW_MS) {
+        // Found a storm window; expand to include all merges within the window
+        const stormStart = times[windowStart];
+        const stormEnd = times[windowEnd];
+        let count = 0;
+        for (let i = windowStart; i < times.length; i++) {
+          if (times[i].getTime() - stormStart.getTime() <= STORM_WINDOW_MS) {
+            count++;
+          } else {
+            break;
+          }
+        }
+        const commitsInvolved = graph.commits.filter(
+          (c) =>
+            c.type === CommitType.MERGE &&
+            c.branches.includes(branch) &&
+            c.date >= stormStart &&
+            c.date <= new Date(stormStart.getTime() + STORM_WINDOW_MS)
+        ).length;
+
+        storms.push({
+          startDate: stormStart,
+          endDate: stormEnd,
+          branch,
+          totalMerges: count,
+          commitsInvolved,
+          description: `Merge storm on ${branch}: ${count} merges within 24 hours (${stormStart.toISOString().split('T')[0]} to ${stormEnd.toISOString().split('T')[0]})`,
+        });
+        break; // Only report one storm per branch for simplicity
       }
-      commitCount++;
-    }
-    if (branches.size >= minBranchThreshold) {
-      const start = lastWindow[0].date.getTime();
-      const end = lastWindow[lastWindow.length - 1].date.getTime();
-      storms.push({
-        startDate: new Date(start),
-        endDate: new Date(end),
-        branchCount: branches.size,
-        commitCount,
-        branches: Array.from(branches),
-        intensity: Math.min(1, commitCount / (branches.size * 2)),
-      });
+      windowStart++;
     }
   }
 
