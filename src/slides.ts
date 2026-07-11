@@ -1,152 +1,88 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { render, Text, Box, useInput, useApp } from 'ink';
 import { Narrative } from './narrator.js';
 import { renderNarrative, OutputFormat } from './output.js';
 
-/**
- * Display a narrative as an animated slideshow in the terminal.
- * Each paragraph fades in one word at a time, with keyboard navigation.
- */
-export function playSlideShow(narrative: Narrative): void {
-  const { waitUntilExit } = render(<SlideShow narrative={narrative} />);
-  waitUntilExit();
+interface SlideConfig {
+  intervalMs?: number;
+  autoPlay?: boolean;
 }
 
-// ─── SlideShow Component ───────────────────────────────────────────────────
-
-interface Slide {
-  title: string;
-  lines: string[];
+interface SlideState {
+  currentSlide: number;
+  totalSlides: number;
+  slides: string[];
 }
 
-function buildSlides(narrative: Narrative): Slide[] {
-  const slides: Slide[] = [];
-
-  // Title slide
-  slides.push({
-    title: narrative.title,
-    lines: [narrative.summary],
-  });
-
-  // One slide per protagonist branch
-  for (const branch of narrative.protagonistBranches) {
-    const lines: string[] = [];
-    lines.push(`Branch: ${branch.branchName}`);
-    lines.push(`Commits: ${branch.commits.length}, Merges: ${branch.mergeCount}`);
-    lines.push(`Lifespan: ${branch.startDate.toLocaleDateString()} – ${branch.endDate.toLocaleDateString()}`);
-    if (branch.authorDiversity !== undefined) {
-      lines.push(`Author Diversity: ${branch.authorDiversity.toFixed(2)}`);
-    }
-    slides.push({ title: branch.branchName, lines });
-  }
-
-  // Conflict arcs
-  if (narrative.conflictArcs && narrative.conflictArcs.length > 0) {
-    for (const conflict of narrative.conflictArcs) {
-      const lines: string[] = [];
-      lines.push(`Conflict: ${conflict.description}`);
-      lines.push(`Branches: ${conflict.branches.join(', ')}`);
-      lines.push(`Resolved in: ${conflict.resolutionHash || 'unresolved'}`);
-      slides.push({ title: `Conflict: ${conflict.description}`, lines });
+export function generateSlides(narrative: Narrative): string[] {
+  const paragraphs = renderNarrative(narrative, OutputFormat.PLAIN).split('\n\n').filter(p => p.trim().length > 0);
+  const slides: string[] = [];
+  let buffer = '';
+  for (const p of paragraphs) {
+    if (buffer.length + p.length > 800) {
+      slides.push(buffer.trim());
+      buffer = p + '\n\n';
+    } else {
+      buffer += p + '\n\n';
     }
   }
-
-  // Merge storms
-  if (narrative.mergeStorms && narrative.mergeStorms.length > 0) {
-    for (const storm of narrative.mergeStorms) {
-      const lines: string[] = [];
-      lines.push(`Merge Storm`);
-      lines.push(`Period: ${storm.startDate.toLocaleDateString()} – ${storm.endDate.toLocaleDateString()}`);
-      lines.push(`Merges: ${storm.mergeCount}`);
-      lines.push(`Branches involved: ${storm.branches.join(', ')}`);
-      slides.push({ title: 'Merge Storm', lines });
-    }
+  if (buffer.trim().length > 0) {
+    slides.push(buffer.trim());
   }
-
-  // Refactor hotspots
-  if (narrative.refactorHotspots && narrative.refactorHotspots.length > 0) {
-    for (const hotspot of narrative.refactorHotspots) {
-      const lines: string[] = [];
-      lines.push(`Refactor Hotspot: ${hotspot.filePath}`);
-      lines.push(`Changes: ${hotspot.changeCount}`);
-      lines.push(`Authors: ${hotspot.authors.join(', ')}`);
-      slides.push({ title: `Hotspot: ${hotspot.filePath}`, lines });
-    }
+  if (slides.length === 0) {
+    slides.push('No narrative content.');
   }
-
   return slides;
 }
 
-// ─── Typewriter effect ─────────────────────────────────────────────────────
-
-function useTypewriter(text: string, speed: number = 30): string {
-  const [displayed, setDisplayed] = useState('');
-  const indexRef = useRef(0);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      indexRef.current += 1;
-      if (indexRef.current > text.length) {
-        clearInterval(interval);
-        return;
-      }
-      setDisplayed(text.slice(0, indexRef.current));
-    }, speed);
-    return () => clearInterval(interval);
-  }, [text, speed]);
-
-  return displayed;
-}
-
-// ─── SlideShow Component ───────────────────────────────────────────────────
-
-const SlideShow: React.FC<{ narrative: Narrative }> = ({ narrative }) => {
-  const slides = useRef(buildSlides(narrative));
-  const [currentSlide, setCurrentSlide] = useState(0);
-  const [animationDone, setAnimationDone] = useState(false);
+const SlideView: React.FC<{ slides: string[]; config?: SlideConfig }> = ({ slides, config }) => {
+  const [current, setCurrent] = useState(0);
   const { exit } = useApp();
 
   useInput((input, key) => {
-    if (input === 'q') {
+    if (key.leftArrow || key.upArrow || input === 'p') {
+      setCurrent(prev => Math.max(0, prev - 1));
+    }
+    if (key.rightArrow || key.downArrow || input === 'n') {
+      setCurrent(prev => Math.min(slides.length - 1, prev + 1));
+    }
+    if (input === 'q' || key.escape || input === 'x') {
       exit();
-      return;
-    }
-    if (key.rightArrow || input === ' ' || input === 'n') {
-      if (currentSlide < slides.current.length - 1) {
-        setCurrentSlide((prev) => prev + 1);
-        setAnimationDone(false);
-      }
-    }
-    if (key.leftArrow || input === 'p') {
-      if (currentSlide > 0) {
-        setCurrentSlide((prev) => prev - 1);
-        setAnimationDone(false);
-      }
-    }
-    if (key.return) {
-      setAnimationDone(true);
     }
   });
 
-  const slide = slides.current[currentSlide];
-  const fullText = slide.lines.join('\n');
-  const animatedText = useTypewriter(fullText, 20);
-
-  // When animation finishes, mark done
   useEffect(() => {
-    if (animatedText.length >= fullText.length) {
-      setAnimationDone(true);
-    }
-  }, [animatedText, fullText]);
+    if (!config?.autoPlay || config.intervalMs === undefined) return;
+    const timer = setInterval(() => {
+      setCurrent(prev => {
+        if (prev >= slides.length - 1) {
+          exit();
+          return prev;
+        }
+        return prev + 1;
+      });
+    }, config.intervalMs);
+    return () => clearInterval(timer);
+  }, [config?.autoPlay, config?.intervalMs, slides.length, exit]);
 
   return (
     <Box flexDirection="column" padding={1}>
-      <Text bold>{slide.title}</Text>
-      <Text> </Text>
-      <Text>{animatedText}</Text>
-      {animationDone && (
-        <Text dimColor>Press → for next slide, ← for previous, ⏎ to skip animation, q to quit</Text>
-      )}
+      <Text bold italic>Git Graph Narrator - Slide {current + 1} of {slides.length}</Text>
+      <Box marginTop={1}>
+        <Text>{slides[current]}</Text>
+      </Box>
+      <Box marginTop={1}>
+        <Text dimColor>
+          Arrow keys or n/p to navigate, q to quit
+          {config?.autoPlay ? ` (auto-advance every ${config.intervalMs}ms)` : ''}
+        </Text>
+      </Box>
     </Box>
   );
 };
+
+export function launchSlides(narrative: Narrative, config?: SlideConfig): void {
+  const slides = generateSlides(narrative);
+  const { waitUntilExit } = render(<SlideView slides={slides} config={config} />);
+  waitUntilExit();
+}
