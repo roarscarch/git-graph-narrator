@@ -2,78 +2,87 @@ import { CommitGraph, CommitNode } from './parser.js';
 import { CommitType } from './classifier.js';
 
 export interface MergeStorm {
-  startDate: Date;
-  endDate: Date;
-  branch: string;
-  totalMerges: number;
-  commitsInvolved: number;
-  description: string;
+  branchName: string;
+  mergeCount: number;
+  timeSpan: { start: Date; end: Date };
+  averageIntervalMs: number;
+  isStorm: boolean;
 }
 
-const MERGE_STORM_THRESHOLD = 3; // minimum number of merges in a short period
-const STORM_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
-
 /**
- * Detects merge storms: periods where a branch experiences an unusually high number of merges
- * within a short time window.
+ * Detects merge storms: branches that have a high density of merge commits within a short time window.
+ * A storm is defined as >= 3 merges within a 1-hour window.
  */
-export function detectMergeStorms(graph: CommitGraph): MergeStorm[] {
-  const storms: MergeStorm[] = [];
-  const branchMergeTimes: Map<string, Date[]> = new Map();
+export function detectMergeStorms(graph: CommitGraph, threshold: number = 3, windowMs: number = 3600000): MergeStorm[] {
+  const branchMerges: Map<string, Date[]> = new Map();
 
   for (const commit of graph.commits) {
     if (commit.type === CommitType.MERGE) {
-      for (const branch of commit.branches) {
-        const times = branchMergeTimes.get(branch) || [];
-        times.push(commit.date);
-        branchMergeTimes.set(branch, times);
+      // Merge commits typically have multiple parents, so we check for merge type
+      // If not classified, fallback: message contains 'merge' or is a merge commit
+      if (commit.message.toLowerCase().includes('merge') || commit.type === CommitType.MERGE) {
+        // Assign to the branch that the merge was made into (first parent's branch?)
+        // For simplicity, we assign to all branches listed, but typically merge is on the target branch
+        for (const branch of commit.branches) {
+          if (!branchMerges.has(branch)) {
+            branchMerges.set(branch, []);
+          }
+          branchMerges.get(branch)!.push(commit.date);
+        }
       }
     }
   }
 
-  for (const [branch, times] of branchMergeTimes.entries()) {
-    if (times.length < MERGE_STORM_THRESHOLD) continue;
+  const storms: MergeStorm[] = [];
 
-    // Sort times in ascending order
-    times.sort((a, b) => a.getTime() - b.getTime());
+  for (const [branchName, dates] of branchMerges.entries()) {
+    if (dates.length < threshold) continue;
 
-    let windowStart = 0;
-    while (windowStart <= times.length - MERGE_STORM_THRESHOLD) {
-      const windowEnd = windowStart + MERGE_STORM_THRESHOLD - 1;
-      const timeSpan = times[windowEnd].getTime() - times[windowStart].getTime();
-      if (timeSpan <= STORM_WINDOW_MS) {
-        // Found a storm window; expand to include all merges within the window
-        const stormStart = times[windowStart];
-        const stormEnd = times[windowEnd];
-        let count = 0;
-        for (let i = windowStart; i < times.length; i++) {
-          if (times[i].getTime() - stormStart.getTime() <= STORM_WINDOW_MS) {
-            count++;
-          } else {
-            break;
-          }
-        }
-        const commitsInvolved = graph.commits.filter(
-          (c) =>
-            c.type === CommitType.MERGE &&
-            c.branches.includes(branch) &&
-            c.date >= stormStart &&
-            c.date <= new Date(stormStart.getTime() + STORM_WINDOW_MS)
-        ).length;
+    // Sort dates ascending
+    dates.sort((a, b) => a.getTime() - b.getTime());
 
-        storms.push({
-          startDate: stormStart,
-          endDate: stormEnd,
-          branch,
-          totalMerges: count,
-          commitsInvolved,
-          description: `Merge storm on ${branch}: ${count} merges within 24 hours (${stormStart.toISOString().split('T')[0]} to ${stormEnd.toISOString().split('T')[0]})`,
-        });
-        break; // Only report one storm per branch for simplicity
+    // Sliding window to find storm clusters
+    let i = 0;
+    while (i < dates.length) {
+      let j = i;
+      while (j < dates.length && dates[j].getTime() - dates[i].getTime() <= windowMs) {
+        j++;
       }
-      windowStart++;
+      const count = j - i;
+      if (count >= threshold) {
+        const start = dates[i];
+        const end = dates[j - 1];
+        const totalMs = end.getTime() - start.getTime();
+        const averageIntervalMs = count > 1 ? totalMs / (count - 1) : 0;
+        storms.push({
+          branchName,
+          mergeCount: count,
+          timeSpan: { start, end },
+          averageIntervalMs,
+          isStorm: true,
+        });
+        i = j; // Move past this cluster
+      } else {
+        i++;
+      }
     }
   }
 
   return storms;
+}
+
+/**
+ * Generates a human-readable summary of merge storms.
+ */
+export function summarizeMergeStorms(storms: MergeStorm[]): string {
+  if (storms.length === 0) {
+    return 'No merge storms detected.';
+  }
+
+  const lines: string[] = ['Merge Storms:'];
+  for (const storm of storms) {
+    const intervalMin = (storm.averageIntervalMs / 60000).toFixed(1);
+    lines.push(`  - On branch "${storm.branchName}": ${storm.mergeCount} merges between ${storm.timeSpan.start.toISOString()} and ${storm.timeSpan.end.toISOString()} (avg interval: ${intervalMin} min)`);
+  }
+  return lines.join('\n');
 }
