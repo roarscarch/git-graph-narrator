@@ -1,88 +1,111 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { render, Text, Box, useInput, useApp } from 'ink';
-import { Narrative } from './narrator.js';
-import { renderNarrative, OutputFormat } from './output.js';
+import { Narrative, BranchNarrative } from './narrator.js';
 
-interface SlideConfig {
-  intervalMs?: number;
-  autoPlay?: boolean;
+export interface Slide {
+  title: string;
+  content: string;
+  delay: number; // in milliseconds
 }
 
-interface SlideState {
-  currentSlide: number;
-  totalSlides: number;
-  slides: string[];
+export interface SlideShow {
+  slides: Slide[];
+  totalDuration: number;
 }
 
-export function generateSlides(narrative: Narrative): string[] {
-  const paragraphs = renderNarrative(narrative, OutputFormat.PLAIN).split('\n\n').filter(p => p.trim().length > 0);
-  const slides: string[] = [];
-  let buffer = '';
-  for (const p of paragraphs) {
-    if (buffer.length + p.length > 800) {
-      slides.push(buffer.trim());
-      buffer = p + '\n\n';
-    } else {
-      buffer += p + '\n\n';
-    }
-  }
-  if (buffer.trim().length > 0) {
-    slides.push(buffer.trim());
-  }
-  if (slides.length === 0) {
-    slides.push('No narrative content.');
-  }
-  return slides;
+function formatDate(date: Date): string {
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
-const SlideView: React.FC<{ slides: string[]; config?: SlideConfig }> = ({ slides, config }) => {
-  const [current, setCurrent] = useState(0);
-  const { exit } = useApp();
+function formatBranch(branch: BranchNarrative): string {
+  const lines: string[] = [];
+  lines.push(`Branch: ${branch.branchName}`);
+  lines.push(`Period: ${formatDate(branch.startDate)} - ${formatDate(branch.endDate)}`);
+  lines.push(`Merges: ${branch.mergeCount}`);
+  lines.push(`Key commits:`);
+  for (const commit of branch.commits.slice(0, 5)) {
+    lines.push(`  ${commit.hash.substring(0, 7)} - ${commit.message} (${commit.author})`);
+  }
+  if (branch.commits.length > 5) {
+    lines.push(`  ... and ${branch.commits.length - 5} more`);
+  }
+  return lines.join('\n');
+}
 
-  useInput((input, key) => {
-    if (key.leftArrow || key.upArrow || input === 'p') {
-      setCurrent(prev => Math.max(0, prev - 1));
-    }
-    if (key.rightArrow || key.downArrow || input === 'n') {
-      setCurrent(prev => Math.min(slides.length - 1, prev + 1));
-    }
-    if (input === 'q' || key.escape || input === 'x') {
-      exit();
-    }
+export function buildSlides(narrative: Narrative): SlideShow {
+  const slides: Slide[] = [];
+
+  // Title slide
+  slides.push({
+    title: narrative.title,
+    content: narrative.summary,
+    delay: 3000,
   });
 
-  useEffect(() => {
-    if (!config?.autoPlay || config.intervalMs === undefined) return;
-    const timer = setInterval(() => {
-      setCurrent(prev => {
-        if (prev >= slides.length - 1) {
-          exit();
-          return prev;
-        }
-        return prev + 1;
+  // Branch slides
+  for (const branch of narrative.protagonistBranches) {
+    slides.push({
+      title: `Branch: ${branch.branchName}`,
+      content: formatBranch(branch),
+      delay: 4000,
+    });
+  }
+
+  // Optional: conflict arcs
+  if (narrative.conflictArcs && narrative.conflictArcs.length > 0) {
+    for (const arc of narrative.conflictArcs) {
+      const arcLines: string[] = [];
+      arcLines.push(`Conflict: ${arc.description}`);
+      arcLines.push(`Intensity: ${arc.severity}`);
+      arcLines.push(`Branches involved: ${arc.branches.join(', ')}`);
+      slides.push({
+        title: `Conflict Arc: ${arc.description.substring(0, 40)}...`,
+        content: arcLines.join('\n'),
+        delay: 3000,
       });
-    }, config.intervalMs);
-    return () => clearInterval(timer);
-  }, [config?.autoPlay, config?.intervalMs, slides.length, exit]);
+    }
+  }
 
-  return (
-    <Box flexDirection="column" padding={1}>
-      <Text bold italic>Git Graph Narrator - Slide {current + 1} of {slides.length}</Text>
-      <Box marginTop={1}>
-        <Text>{slides[current]}</Text>
-      </Box>
-      <Box marginTop={1}>
-        <Text dimColor>
-          Arrow keys or n/p to navigate, q to quit
-          {config?.autoPlay ? ` (auto-advance every ${config.intervalMs}ms)` : ''}
-        </Text>
-      </Box>
-    </Box>
-  );
-};
+  // Optional: merge storms
+  if (narrative.mergeStorms && narrative.mergeStorms.length > 0) {
+    for (const storm of narrative.mergeStorms) {
+      const stormLines: string[] = [];
+      stormLines.push(`Merge Storm: ${storm.description}`);
+      stormLines.push(`Date: ${formatDate(storm.date)}`);
+      stormLines.push(`Merges count: ${storm.mergeCount}`);
+      slides.push({
+        title: `Merge Storm: ${storm.description.substring(0, 40)}...`,
+        content: stormLines.join('\n'),
+        delay: 3000,
+      });
+    }
+  }
 
-export function launchSlides(narrative: Narrative, config?: SlideConfig): void {
-  const slides = generateSlides(narrative);
-  const { waitUntilExit } = render(<SlideView slides={slides} config={config} />);
-  waitUntilExit();
+  // Closing slide
+  slides.push({
+    title: 'The End',
+    content: 'Generated by Git Graph Narrator',
+    delay: 2000,
+  });
+
+  const totalDuration = slides.reduce((acc, s) => acc + s.delay, 0);
+
+  return { slides, totalDuration };
 }
+
+export function renderSlide(slide: Slide): string {
+  const separator = '='.repeat(60);
+  return `${separator}\n${slide.title}\n${separator}\n\n${slide.content}\n\n${separator}`;
+}
+
+export function renderSlideShow(show: SlideShow): string {
+  return show.slides.map(s => renderSlide(s)).join('\n\n***\n\n');
+}
+
+// Helper to simulate animated output (prints slide, then waits)
+export function animateSlideShow(show: SlideShow, onSlide: (slide: Slide, index: number) => void): void {
+  for (let i = 0; i < show.slides.length; i++) {
+    onSlide(show.slides[i], i);
+  }
+}
+
+// Export additional types for external use
+export type { Narrative, BranchNarrative } from './narrator.js';
