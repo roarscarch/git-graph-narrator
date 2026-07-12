@@ -1,62 +1,43 @@
-import fs from 'fs';
-import path from 'path';
 import { Command } from 'commander';
-import { parseGitLog } from '../parser.js';
-import { classifyCommits } from '../classifier.js';
+import { parseGitLog, CommitGraph } from '../parser.js';
+import { rankCommits } from '../ranker.js';
 import { buildNarrative } from '../narrator.js';
-import { renderNarrative } from '../output.js';
-import { loadConfig } from '../config.js';
+import { renderNarrative, OutputFormat } from '../output.js';
+import { detectMergeStorms } from '../mergeStorm.js';
+import { detectConflictArcs } from '../conflict-arcs.js';
+import { classifyBranches, BranchProfile } from '../branch-classifier.js';
 import { renderSlides } from '../slides.js';
+import { loadConfig } from '../config.js';
 
-export function storyCommand(): Command {
-  const cmd = new Command('story')
-    .description('Generate a narrative from git history')
-    .option('-d, --directory <dir>', 'Path to git repository', '.')
-    .option('-o, --output <file>', 'Output file (optional, prints to stdout if not set)')
-    .option('-f, --format <format>', 'Output format: text, markdown, slides', 'text')
-    .option('--interactive', 'Run in interactive slideshow mode', false)
+export function createStoryCommand(): Command {
+  const command = new Command('story')
+    .description('Generate a narrative from your git repository history')
+    .option('-f, --format <format>', 'output format: text, markdown, slides', 'text')
+    .option('-c, --config <path>', 'path to config file')
+    .option('-p, --path <path>', 'path to git repository', '.')
     .action(async (options) => {
+      const config = options.config ? loadConfig(options.config) : {};
+      const format = options.format as OutputFormat;
+
       try {
-        const config = loadConfig(options.directory);
-        const gitDir = path.resolve(options.directory);
-        if (!fs.existsSync(path.join(gitDir, '.git'))) {
-          console.error('Error: Not a git repository: ' + gitDir);
-          process.exit(1);
-        }
+        const graph: CommitGraph = await parseGitLog(options.path);
+        const rankedGraph = rankCommits(graph);
+        const mergeStorms = detectMergeStorms(rankedGraph);
+        const conflictArcs = detectConflictArcs(rankedGraph, mergeStorms);
+        const branchProfiles: BranchProfile[] = classifyBranches(rankedGraph);
+        const narrative = buildNarrative(rankedGraph, branchProfiles, mergeStorms, conflictArcs);
 
-        const graph = parseGitLog(gitDir);
-        const classifiedCommits = classifyCommits(graph.commits);
-        graph.commits = classifiedCommits;
-        const narrative = buildNarrative(graph);
-
-        const format = options.format;
-        const output = options.output;
-
-        if (format === 'slides' || options.interactive) {
-          if (options.interactive) {
-            await renderSlides(narrative, true);
-          } else {
-            const slides = renderNarrative(narrative, 'slides');
-            if (output) {
-              fs.writeFileSync(output, slides, 'utf-8');
-            } else {
-              console.log(slides);
-            }
-          }
+        if (format === 'slides') {
+          await renderSlides(narrative, config);
         } else {
-          const rendered = renderNarrative(narrative, format as 'text' | 'markdown');
-          if (output) {
-            fs.writeFileSync(output, rendered, 'utf-8');
-          } else {
-            console.log(rendered);
-          }
+          const output = renderNarrative(narrative, format);
+          process.stdout.write(output);
         }
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.error('Error generating story:', message);
+      } catch (error) {
+        console.error('Error generating story:', error instanceof Error ? error.message : error);
         process.exit(1);
       }
     });
 
-  return cmd;
+  return command;
 }
